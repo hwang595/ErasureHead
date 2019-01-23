@@ -8,34 +8,67 @@ import scipy.sparse as sps
 import time
 from mpi4py import MPI
 
-def naive_logistic_regression(n_procs, n_samples, n_features, input_dir, n_stragglers, is_real_data, params, add_delay, update_rule):
+#NUM_WORKER_GATHER=10
+
+
+def approx_logistic_regression(n_procs, n_samples, n_features, input_dir, n_stragglers, is_real_data, params, num_collect, add_delay, update_rule):
 
     assert update_rule in ('GD', 'AGD')
 
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
-    
+
+    __num_worker_gather=num_collect
     n_workers = n_procs-1
+
+    if (n_workers%(n_stragglers+1)):
+        print("Error: n_workers must be multiple of n_stragglers+1!")
+        sys.exit(0)
+
     rounds = params[0]
 
     #beta=np.zeros(n_features)
     beta=np.random.randn(n_features)
 
-    # Loading data on workers
+    #rows_per_worker=n_samples/(n_procs-1)
+    rows_per_worker = n_samples//(n_procs-1)
+    n_groups=n_workers/(n_stragglers+1)
+
+    # Loading the data
     if (rank):
 
         if not is_real_data:
-            X_current = load_data(input_dir+str(rank)+".dat")
+
+            X_current=np.zeros(((1+n_stragglers)*rows_per_worker,n_features))
+            y_current=np.zeros((1+n_stragglers)*rows_per_worker)
             y = load_data(input_dir+"label.dat")
+
+            for i in range(1+n_stragglers):
+                a=(rank-1)/(n_stragglers+1) # index of group
+                b=(rank-1)%(n_stragglers+1) # position inside the group
+                idx=int((n_stragglers+1)*a+(b+i)%(n_stragglers+1))
+                
+                X_current[i*rows_per_worker:(i+1)*rows_per_worker,:]=load_data(input_dir+str(idx+1)+".dat")
+                y_current[i*rows_per_worker:(i+1)*rows_per_worker]=y[idx*rows_per_worker:(idx+1)*rows_per_worker]
+
         else:
-            X_current = load_sparse_csr(input_dir+str(rank))
+
+            y_current=np.zeros((1+n_stragglers)*rows_per_worker)
             y = load_data(input_dir+"label.dat")
+            for i in range(1+n_stragglers):
+                a=(rank-1)/(n_stragglers+1) # index of group
+                b=(rank-1)%(n_stragglers+1) # position inside the group
+                idx=int((n_stragglers+1)*a+(b+i)%(n_stragglers+1))
+                
+                if i==0:
+                    X_current=load_sparse_csr(input_dir+str(idx+1))
+                else:
+                    X_temp = load_sparse_csr(input_dir+str(idx+1))
+                    X_current = sps.vstack((X_current,X_temp))
+                y_current[i*rows_per_worker:(i+1)*rows_per_worker]=y[idx*rows_per_worker:(idx+1)*rows_per_worker]
 
-        rows_per_worker = X_current.shape[0]
-        y_current=y[(rank-1)*rows_per_worker:rank*rows_per_worker]
-
-    # Initializing relevant variables
+    # Initializing relevant variables            
     if (rank):
 
         predy = X_current.dot(beta)
@@ -50,25 +83,27 @@ def naive_logistic_regression(n_procs, n_samples, n_features, input_dir, n_strag
         betaset = np.zeros((rounds, n_features))
         timeset = np.zeros(rounds)
         worker_timeset=np.zeros((rounds, n_procs-1))
-        
+
         request_set = []
         recv_reqs = []
+        send_set = []
 
-        cnt_completed = 0
+        cnt_groups = 0
+        completed_groups=np.ndarray(n_groups,dtype=bool)
+        completed_workers = np.ndarray(n_procs-1,dtype=bool)
 
         status = MPI.Status()
 
-        eta0=params[2] # ----- learning rate schedule
+        eta0=params[2] # ----- learning rate
         alpha = params[1] # --- coefficient of l2 regularization
         utemp = np.zeros(n_features) # for accelerated gradient descent
-   
+
     # Posting all Irecv requests for master and workers
     if (rank):
 
         for i in range(rounds):
             req = comm.Irecv([beta, MPI.DOUBLE], source=0, tag=i)
             recv_reqs.append(req)
-
     else:
 
         for i in range(rounds):
@@ -78,36 +113,50 @@ def naive_logistic_regression(n_procs, n_samples, n_features, input_dir, n_strag
                 recv_reqs.append(req)
             request_set.append(recv_reqs)
 
-    ########################################################################################################
+    ###########################################################################################
     comm.Barrier()
-
-    if rank==0:
-        orig_start_time= time.time()
-        print("---- Starting Naive Iterations ----")
+    if rank == 0:
+        print("---- Starting Approx Coding Iterations for " +str(n_stragglers) + " stragglers" + "simulated delay " + str(add_delay) + "-------")
+        orig_start_time = time.time()
 
     for i in range(rounds):
-        
         if rank==0:
 
+            
             if(i%10 == 0):
                 print("\t >>> At Iteration %d" %(i))
 
-            start_time = time.time()
-
-            for l in range(1,n_procs):
-                comm.Isend([beta,MPI.DOUBLE],dest=l,tag=i)
-
+            send_set[:] = []
             g[:]=0
-            cnt_completed = 0
+            completed_groups[:]=False
+            completed_workers[:]=False
+            cnt_groups=0
+            cnt_workers=0
+            
+            start_time = time.time()
+            
+            # bcast model step
+            for l in range(1,n_procs):
+                sreq = comm.Isend([beta, MPI.DOUBLE], dest = l, tag = i)
+                send_set.append(sreq)
 
-            while cnt_completed < n_procs-1:
+
+            while (cnt_workers<__num_worker_gather) and (cnt_groups<n_groups):
                 req_done = MPI.Request.Waitany(request_set[i], status)
                 src = status.Get_source()
                 worker_timeset[i,src-1]=time.time()-start_time
                 request_set[i].pop(req_done)
-                
-                g+=msgBuffers[src-1]   # add the partial gradients
-                cnt_completed+=1
+
+                completed_workers[src-1] = True
+                groupid = (src-1)/(n_stragglers+1)
+                #g += msgBuffers[src-1]
+                cnt_workers += 1
+
+                if (not completed_groups[groupid]):
+                    completed_groups[groupid]=True
+                    g += msgBuffers[src-1]
+                    cnt_groups += 1
+
 
             grad_multiplier = eta0[i]/n_samples
             # ---- update step for gradient descent
@@ -122,17 +171,25 @@ def naive_logistic_regression(n_procs, n_samples, n_features, input_dir, n_strag
                 beta[:] = betatemp
             else:
                 raise Exception("Error update rule")
-            
+
             timeset[i] = time.time() - start_time
+
             betaset[i,:] = beta
+            ind_set = [l for l in range(1,n_procs) if not completed_workers[l-1]]
+            for l in ind_set:
+                worker_timeset[i,l-1]=-1
+
+            MPI.Request.Waitall(send_set)
+            MPI.Request.Waitall(request_set[i])
 
         else:
-
-            recv_reqs[i].Wait()
             
-            # sendTestBuf = send_req.test()
-            # if not sendTestBuf[0]:
-            #     send_req.Cancel()
+            recv_reqs[i].Wait()
+
+            sendTestBuf = send_req.test()
+            if not sendTestBuf[0]:
+                send_req.Cancel()
+                #print("Worker " + str(rank) + " cancelled send request for Iteration " + str(i))
 
             predy = X_current.dot(beta)
             g = X_current.T.dot(np.divide(y_current,np.exp(np.multiply(predy,y_current))+1))
@@ -148,8 +205,8 @@ def naive_logistic_regression(n_procs, n_samples, n_features, input_dir, n_strag
                 time.sleep(delay)
             ###################################################################################################################
             send_req = comm.Isend([g, MPI.DOUBLE], dest=0, tag=i)
-
-    #####################################################################################################
+            
+    #############################################################################################
     comm.Barrier()
     if rank==0:
         elapsed_time= time.time() - orig_start_time
@@ -157,11 +214,9 @@ def naive_logistic_regression(n_procs, n_samples, n_features, input_dir, n_strag
         # Load all training data
         if not is_real_data:
             X_train = load_data(input_dir+"1.dat")
-            print(">> Loaded 1")
             for j in range(2,n_procs-1):
                 X_temp = load_data(input_dir+str(j)+".dat")
                 X_train = np.vstack((X_train, X_temp))
-                print(">> Loaded "+str(j))
         else:
             X_train = load_sparse_csr(input_dir+"1")
             for j in range(2,n_procs-1):
@@ -201,48 +256,80 @@ def naive_logistic_regression(n_procs, n_samples, n_features, input_dir, n_strag
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-        save_vector(training_loss, output_dir+"naive_acc_training_loss.dat")
-        save_vector(testing_loss, output_dir+"naive_acc_testing_loss.dat")
-        save_vector(auc_loss, output_dir+"naive_acc_auc.dat")
-        save_vector(timeset, output_dir+"naive_acc_timeset.dat")
-        save_matrix(worker_timeset, output_dir+"naive_acc_worker_timeset.dat")
+        save_vector(training_loss, output_dir+"replication_acc_%d_training_loss.dat"%(n_stragglers))
+        save_vector(testing_loss, output_dir+"replication_acc_%d_testing_loss.dat"%(n_stragglers))
+        save_vector(auc_loss, output_dir+"replication_acc_%d_auc.dat"%(n_stragglers))
+        save_vector(timeset, output_dir+"replication_acc_%d_timeset.dat"%(n_stragglers))
+        save_matrix(worker_timeset, output_dir+"replication_acc_%d_worker_timeset.dat"%(n_stragglers))
         print(">>> Done")
 
     comm.Barrier()
 
 
-def naive_linear_regression(n_procs, n_samples, n_features, input_dir, n_stragglers, is_real_data, params, add_delay, update_rule):
+
+def approx_linear_regression(n_procs, n_samples, n_features, input_dir, n_stragglers, is_real_data, params, num_collect, add_delay, update_rule):
 
     assert update_rule in ('GD', 'AGD')
 
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
-    
+
+    __num_worker_gather=num_collect
     n_workers = n_procs-1
+
+    if (n_workers%(n_stragglers+1)):
+        print("Error: n_workers must be multiple of n_stragglers+1!")
+        sys.exit(0)
+
     rounds = params[0]
 
     #beta=np.zeros(n_features)
     beta=np.random.randn(n_features)
 
-    # Loading data on workers
+    #rows_per_worker=n_samples/(n_procs-1)
+    rows_per_worker = n_samples//(n_procs-1)
+    n_groups=n_workers/(n_stragglers+1)
+
+    # Loading the data
     if (rank):
 
         if not is_real_data:
-            X_current = load_data(input_dir+str(rank)+".dat")
+
+            X_current=np.zeros(((1+n_stragglers)*rows_per_worker,n_features))
+            y_current=np.zeros((1+n_stragglers)*rows_per_worker)
             y = load_data(input_dir+"label.dat")
+
+            for i in range(1+n_stragglers):
+                a=(rank-1)/(n_stragglers+1) # index of group
+                b=(rank-1)%(n_stragglers+1) # position inside the group
+                idx=int((n_stragglers+1)*a+(b+i)%(n_stragglers+1))
+                
+                X_current[i*rows_per_worker:(i+1)*rows_per_worker,:]=load_data(input_dir+str(idx+1)+".dat")
+                y_current[i*rows_per_worker:(i+1)*rows_per_worker]=y[idx*rows_per_worker:(idx+1)*rows_per_worker]
+
         else:
-            X_current = load_sparse_csr(input_dir+str(rank))
+
+            y_current=np.zeros((1+n_stragglers)*rows_per_worker)
             y = load_data(input_dir+"label.dat")
+            for i in range(1+n_stragglers):
+                a=(rank-1)/(n_stragglers+1) # index of group
+                b=(rank-1)%(n_stragglers+1) # position inside the group
+                idx=int((n_stragglers+1)*a+(b+i)%(n_stragglers+1))
+                
+                if i==0:
+                    X_current=load_sparse_csr(input_dir+str(idx+1))
+                else:
+                    X_temp = load_sparse_csr(input_dir+str(idx+1))
+                    X_current = sps.vstack((X_current,X_temp))
+                y_current[i*rows_per_worker:(i+1)*rows_per_worker]=y[idx*rows_per_worker:(idx+1)*rows_per_worker]
 
-        rows_per_worker = X_current.shape[0]
-        y_current=y[(rank-1)*rows_per_worker:rank*rows_per_worker]
-
-    # Initializing relevant variables
+    # Initializing relevant variables            
     if (rank):
 
         predy = X_current.dot(beta)
         #g = -X_current.T.dot(np.divide(y_current,np.exp(np.multiply(predy,y_current))+1))
+
         g = -2*X_current.T.dot(y_current - predy)
         send_req = MPI.Request()
         recv_reqs = []
@@ -254,25 +341,27 @@ def naive_linear_regression(n_procs, n_samples, n_features, input_dir, n_straggl
         betaset = np.zeros((rounds, n_features))
         timeset = np.zeros(rounds)
         worker_timeset=np.zeros((rounds, n_procs-1))
-        
+
         request_set = []
         recv_reqs = []
+        send_set = []
 
-        cnt_completed = 0
+        cnt_groups = 0
+        completed_groups=np.ndarray(n_groups,dtype=bool)
+        completed_workers = np.ndarray(n_procs-1,dtype=bool)
 
         status = MPI.Status()
 
-        eta0=params[2] # ----- learning rate schedule
+        eta0=params[2] # ----- learning rate
         alpha = params[1] # --- coefficient of l2 regularization
         utemp = np.zeros(n_features) # for accelerated gradient descent
-   
+
     # Posting all Irecv requests for master and workers
     if (rank):
 
         for i in range(rounds):
             req = comm.Irecv([beta, MPI.DOUBLE], source=0, tag=i)
             recv_reqs.append(req)
-
     else:
 
         for i in range(rounds):
@@ -282,36 +371,50 @@ def naive_linear_regression(n_procs, n_samples, n_features, input_dir, n_straggl
                 recv_reqs.append(req)
             request_set.append(recv_reqs)
 
-    ########################################################################################################
+    ###########################################################################################
     comm.Barrier()
-
-    if rank==0:
-        orig_start_time= time.time()
-        print("---- Starting Naive Iterations ----")
+    if rank == 0:
+        print("---- Starting Approx Coding Iterations for " +str(n_stragglers) + " stragglers" + "simulated delay " + str(add_delay) + "-------")
+        orig_start_time = time.time()
 
     for i in range(rounds):
-        
         if rank==0:
 
+            
             if(i%10 == 0):
                 print("\t >>> At Iteration %d" %(i))
 
-            start_time = time.time()
-
-            for l in range(1,n_procs):
-                comm.Isend([beta,MPI.DOUBLE],dest=l,tag=i)
-
+            send_set[:] = []
             g[:]=0
-            cnt_completed = 0
+            completed_groups[:]=False
+            completed_workers[:]=False
+            cnt_groups=0
+            cnt_workers=0
+            
+            start_time = time.time()
+            
+            # bcast model step
+            for l in range(1,n_procs):
+                sreq = comm.Isend([beta, MPI.DOUBLE], dest = l, tag = i)
+                send_set.append(sreq)
 
-            while cnt_completed < n_procs-1:
+
+            while (cnt_workers<__num_worker_gather) and (cnt_groups<n_groups):
                 req_done = MPI.Request.Waitany(request_set[i], status)
                 src = status.Get_source()
                 worker_timeset[i,src-1]=time.time()-start_time
                 request_set[i].pop(req_done)
-                
-                g+=msgBuffers[src-1]   # add the partial gradients
-                cnt_completed+=1
+
+                completed_workers[src-1] = True
+                groupid = (src-1)/(n_stragglers+1)
+                #g += msgBuffers[src-1]
+                cnt_workers += 1
+
+                if (not completed_groups[groupid]):
+                    completed_groups[groupid]=True
+                    g += msgBuffers[src-1]
+                    cnt_groups += 1
+
 
             grad_multiplier = eta0[i]/n_samples
             # ---- update step for gradient descent
@@ -326,22 +429,29 @@ def naive_linear_regression(n_procs, n_samples, n_features, input_dir, n_straggl
                 beta[:] = betatemp
             else:
                 raise Exception("Error update rule")
-            
+
             timeset[i] = time.time() - start_time
+
             betaset[i,:] = beta
+            ind_set = [l for l in range(1,n_procs) if not completed_workers[l-1]]
+            for l in ind_set:
+                worker_timeset[i,l-1]=-1
+
+            MPI.Request.Waitall(send_set)
+            MPI.Request.Waitall(request_set[i])
 
         else:
-
-            recv_reqs[i].Wait()
             
-            # sendTestBuf = send_req.test()
-            # if not sendTestBuf[0]:
-            #     send_req.Cancel()
+            recv_reqs[i].Wait()
+
+            sendTestBuf = send_req.test()
+            if not sendTestBuf[0]:
+                send_req.Cancel()
+                #print("Worker " + str(rank) + " cancelled send request for Iteration " + str(i))
 
             predy = X_current.dot(beta)
-            
-            # TODO: gradient of linear regression
             #g = X_current.T.dot(np.divide(y_current,np.exp(np.multiply(predy,y_current))+1))
+            #g *= -1
             g = X_current.T.dot(y_current - predy)
             g *= -2
             ########################################## straggler simulation ###################################################
@@ -355,8 +465,8 @@ def naive_linear_regression(n_procs, n_samples, n_features, input_dir, n_straggl
                 time.sleep(delay)
             ###################################################################################################################
             send_req = comm.Isend([g, MPI.DOUBLE], dest=0, tag=i)
-
-    #####################################################################################################
+            
+    #############################################################################################
     comm.Barrier()
     if rank==0:
         elapsed_time= time.time() - orig_start_time
@@ -364,11 +474,9 @@ def naive_linear_regression(n_procs, n_samples, n_features, input_dir, n_straggl
         # Load all training data
         if not is_real_data:
             X_train = load_data(input_dir+"1.dat")
-            print(">> Loaded 1")
             for j in range(2,n_procs-1):
                 X_temp = load_data(input_dir+str(j)+".dat")
                 X_train = np.vstack((X_train, X_temp))
-                print(">> Loaded "+str(j))
         else:
             X_train = load_sparse_csr(input_dir+"1")
             for j in range(2,n_procs-1):

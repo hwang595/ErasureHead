@@ -6,6 +6,7 @@ import numpy as np
 import itertools
 import scipy.special as sp
 from scipy.sparse import csr_matrix
+from sklearn.metrics import mean_squared_error
 
 # ---- Data generation, saving, loading and modification routines
 
@@ -134,3 +135,7 @@ def calculate_indexA(boolvec):
 
 def calculate_loss(y,predy,n_samples):
     return np.sum(np.log(1+np.exp(-np.multiply(y,predy))))/n_samples
+
+def calculate_mse(y, predy, n_samples):
+    #return np.linalg.norm(y-predy)**2/n_samples
+    return mean_squared_error(y, predy)

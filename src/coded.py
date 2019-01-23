@@ -9,7 +9,9 @@ from mpi4py import MPI
 import scipy.special as sp
 import scipy.sparse as sps
 
-def coded_logistic_regression(n_procs, n_samples, n_features, input_dir, n_stragglers, is_real_data, params):
+def coded_logistic_regression(n_procs, n_samples, n_features, input_dir, n_stragglers, is_real_data, params, add_delay, update_rule):
+
+    assert update_rule in ('GD', 'AGD')
 
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
@@ -151,14 +153,17 @@ def coded_logistic_regression(n_procs, n_samples, n_features, input_dir, n_strag
             
             grad_multiplier = eta0[i]/n_samples
             # ---- update step for gradient descent
-            # np.subtract((1-2*alpha*eta0[i])*beta , grad_multiplier*g, out=beta)
-
+            if update_rule == "GD":
+                np.subtract((1-2*alpha*eta0[i])*beta , grad_multiplier*g, out=beta)
+            elif update_rule == "AGD":
             # ---- updates for accelerated gradient descent
-            theta = 2.0/(i+2.0)
-            ytemp = (1-theta)*beta + theta*utemp
-            betatemp = ytemp - grad_multiplier*g - (2*alpha*eta0[i])*beta
-            utemp = beta + (betatemp-beta)*(1/theta)
-            beta[:] = betatemp
+                theta = 2.0/(i+2.0)
+                ytemp = (1-theta)*beta + theta*utemp
+                betatemp = ytemp - grad_multiplier*g - (2*alpha*eta0[i])*beta
+                utemp = beta + (betatemp-beta)*(1/theta)
+                beta[:] = betatemp
+            else:
+                raise Exception("Error update rule")
 
             timeset[i] = time.time() - start_time
             betaset[i,:] = beta
@@ -178,6 +183,16 @@ def coded_logistic_regression(n_procs, n_samples, n_features, input_dir, n_strag
             predy = X_current.dot(beta)
             g = X_current.T.dot(np.divide(y_current_mod,np.exp(np.multiply(predy,y_current))+1))
             g *= -1
+            ########################################## straggler simulation ###################################################
+            if add_delay == 1:
+                np.random.seed(seed=i)
+                #straggler_indices = np.random.choice([t for t in range(1, n_workers+1)], n_stragglers, replace=False)
+                #if rank in straggler_indices:
+                #    time.sleep(time_sleep)
+                artificial_delays = np.random.exponential(0.5, n_workers)
+                delay = artificial_delays[rank-1]
+                time.sleep(delay)
+            ###################################################################################################################
             send_req = comm.Isend([g, MPI.DOUBLE], dest=0, tag=i)
 
     #####################################################################################################
