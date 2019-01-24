@@ -6,6 +6,8 @@ This repo extends the [original repo](https://github.com/rashisht1/gradient_codi
 ## Overview:
 ErasureHead is a new approach for distributed gradient descent (GD) that mitigates system delays by employing approximate gradient coding. ErasureHead uses approximate gradient codes to recover an inexact gradient at each iteration, but with significantly higher delay tolerance. Unlike prior work on gradient coding, we provide a performance analysis that combines both delay and convergence guarantees. We establish that down to a small noise floor, ErasureHead converges as quickly as distributed GD and has faster overall runtime under a probabilistic delay model.
 
+<div align="center"><img src="https://github.com/hwang595/ErasureHead/blob/master/images/straggler.jpg" height="350" width="450" ></div>
+
 ## Depdendencies:
 Tested stable depdencises:
 * python 2.7 (Anaconda)
